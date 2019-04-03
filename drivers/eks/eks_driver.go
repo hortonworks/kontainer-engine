@@ -29,7 +29,7 @@ import (
 	"github.com/rancher/kontainer-engine/types"
 	"github.com/sirupsen/logrus"
 	"gopkg.in/yaml.v2"
-	v1 "k8s.io/api/core/v1"
+	"k8s.io/api/core/v1"
 	"k8s.io/apimachinery/pkg/api/errors"
 	v12 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/client-go/kubernetes"
@@ -89,6 +89,7 @@ type state struct {
 
 	KubernetesVersion string
 
+	InstanceCount int64
 	MinimumASGSize int64
 	MaximumASGSize int64
 	NodeVolumeSize *int64
@@ -153,6 +154,13 @@ func (d *Driver) GetDriverCreateOptions(ctx context.Context) (*types.DriverFlags
 		Usage: "The type of machine to use for worker nodes",
 		Default: &types.Default{
 			DefaultString: "t2.medium",
+		},
+	}
+	driverFlag.Options["instance-count"] = &types.Flag{
+		Type:  types.IntType,
+		Usage: "The initially instance count of worker nodes",
+		Default: &types.Default{
+			DefaultInt: 2,
 		},
 	}
 	driverFlag.Options["minimum-nodes"] = &types.Flag{
@@ -267,6 +275,7 @@ func getStateFromOptions(driverOptions *types.DriverOptions) (state, error) {
 
 	state.Region = options.GetValueFromDriverOptions(driverOptions, types.StringType, "region").(string)
 	state.InstanceType = options.GetValueFromDriverOptions(driverOptions, types.StringType, "instance-type", "instanceType").(string)
+	state.InstanceCount = options.GetValueFromDriverOptions(driverOptions, types.IntType, "instance-count", "instanceCount").(int64)
 	state.MinimumASGSize = options.GetValueFromDriverOptions(driverOptions, types.IntType, "minimum-nodes", "minimumNodes").(int64)
 	state.MaximumASGSize = options.GetValueFromDriverOptions(driverOptions, types.IntType, "maximum-nodes", "maximumNodes").(int64)
 	state.NodeVolumeSize, _ = options.GetValueFromDriverOptions(driverOptions, types.IntPointerType, "node-volume-size", "nodeVolumeSize").(*int64)
@@ -321,6 +330,14 @@ func (state *state) validate() error {
 
 	if state.MaximumASGSize < state.MinimumASGSize {
 		return fmt.Errorf("maximum nodes cannot be less than minimum nodes")
+	}
+
+	if state.InstanceCount < state.MinimumASGSize {
+		return fmt.Errorf("instance count cannot be less than minimum nodes")
+	}
+
+	if state.InstanceCount > state.MaximumASGSize {
+		return fmt.Errorf("instance count cannot be greater than maximum nodes")
 	}
 
 	if state.NodeVolumeSize != nil && *state.NodeVolumeSize < 1 {
@@ -469,7 +486,7 @@ func (d *Driver) Create(ctx context.Context, options *types.DriverOptions, _ *ty
 	var subnetIds []*string
 	var securityGroups []*string
 	if state.VirtualNetwork == "" {
-		logrus.Infof("Bringing up vpc")
+		logrus.Infof("Bringing up vpc:%s", getVPCStackName(state.DisplayName))
 
 		stack, err := d.createStack(svc, getVPCStackName(state.DisplayName), displayName, vpcTemplate, []string{},
 			[]*cloudformation.Parameter{})
@@ -495,6 +512,7 @@ func (d *Driver) Create(ctx context.Context, options *types.DriverOptions, _ *ty
 		}
 
 		for _, resource := range resources.StackResources {
+			logrus.Infof("LogicalResourceId: %s PhysicalResourceId: %s",*resource.LogicalResourceId, *resource.PhysicalResourceId)
 			if *resource.LogicalResourceId == "VPC" {
 				vpcid = *resource.PhysicalResourceId
 			}
@@ -534,7 +552,7 @@ func (d *Driver) Create(ctx context.Context, options *types.DriverOptions, _ *ty
 		roleARN = *role.Role.Arn
 	}
 
-	logrus.Infof("Creating EKS cluster")
+	logrus.Infof("Creating EKS cluster: %s", state.DisplayName)
 
 	eksService := eks.New(sess)
 	_, err = eksService.CreateCluster(&eks.CreateClusterInput{
@@ -555,7 +573,7 @@ func (d *Driver) Create(ctx context.Context, options *types.DriverOptions, _ *ty
 		return info, err
 	}
 
-	logrus.Infof("Cluster provisioned successfully")
+	logrus.Infof("Cluster %s provisioned successfully", state.DisplayName)
 
 	capem, err := base64.StdEncoding.DecodeString(*cluster.Cluster.CertificateAuthority.Data)
 	if err != nil {
@@ -571,7 +589,7 @@ func (d *Driver) Create(ctx context.Context, options *types.DriverOptions, _ *ty
 		return info, fmt.Errorf("error creating key pair %v", err)
 	}
 
-	logrus.Infof("Creating worker nodes")
+	logrus.Infof("Creating worker nodes! Stack-name: %s", getWorkNodeName(state.DisplayName))
 
 	var amiID string
 	if state.AMI != "" {
@@ -607,6 +625,8 @@ func (d *Driver) Create(ctx context.Context, options *types.DriverOptions, _ *ty
 				ParameterValue: aws.String(strings.Join(toStringLiteralSlice(securityGroups), ","))},
 			{ParameterKey: aws.String("NodeGroupName"),
 				ParameterValue: aws.String(state.DisplayName + "-node-group")},
+			{ParameterKey: aws.String("NodeAutoScalingGroupDesiredCapacity"), ParameterValue: aws.String(strconv.Itoa(
+				int(state.InstanceCount)))},
 			{ParameterKey: aws.String("NodeAutoScalingGroupMinSize"), ParameterValue: aws.String(strconv.Itoa(
 				int(state.MinimumASGSize)))},
 			{ParameterKey: aws.String("NodeAutoScalingGroupMaxSize"), ParameterValue: aws.String(strconv.Itoa(
