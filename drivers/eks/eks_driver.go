@@ -6,6 +6,7 @@ import (
 	"encoding/json"
 	"fmt"
 	"io/ioutil"
+	"net"
 	"os"
 	"reflect"
 	"strconv"
@@ -106,7 +107,20 @@ type state struct {
 	AMI                         string
 	AssociateWorkerNodePublicIP *bool
 
+	IngressRules []string
+	EgressRules []string
+
+	_ingressRules []securityGroupRule
+	_egressRules []securityGroupRule
+
 	ClusterInfo types.ClusterInfo
+}
+
+type securityGroupRule struct {
+	protocol string
+	fromPort int16
+	toPort int16
+	cidrIP string
 }
 
 func NewDriver() types.Driver {
@@ -215,6 +229,20 @@ func (d *Driver) GetDriverCreateOptions(ctx context.Context) (*types.DriverFlags
 			DefaultBool: true,
 		},
 	}
+	driverFlag.Options["ingress-rules"] = &types.Flag{
+		Type:  types.StringSliceType,
+		Usage: "Comma-separated list of ingress rules of the form protocol:fromPort[:toPort[:cidrIP]]",
+		Default: &types.Default{
+			DefaultStringSlice: &types.StringSlice{Value: []string{}}, //avoid nil value for init
+		},
+	}
+	driverFlag.Options["egress-rules"] = &types.Flag{
+		Type:  types.StringSliceType,
+		Usage: "Comma-separated list of egress rules of the form protocol:fromPort[:toPort[:cidrIP]]",
+		Default: &types.Default{
+			DefaultStringSlice: &types.StringSlice{Value: []string{}}, //avoid nil value for init
+		},
+	}
 	// Newlines are expected to always be passed as "\n"
 	driverFlag.Options["user-data"] = &types.Flag{
 		Type:  types.StringType,
@@ -289,7 +317,59 @@ func getStateFromOptions(driverOptions *types.DriverOptions) (state, error) {
 	// UserData
 	state.UserData = options.GetValueFromDriverOptions(driverOptions, types.StringType, "user-data", "userData").(string)
 
+	state.IngressRules = options.GetValueFromDriverOptions(driverOptions, types.StringSliceType, "ingress-rules").(*types.StringSlice).Value
+	ingressRules, err := state.convertSecurityGroupRules(state.IngressRules)
+	if err != nil {
+		return state, err
+	}
+	state._ingressRules = ingressRules
+	state.EgressRules = options.GetValueFromDriverOptions(driverOptions, types.StringSliceType, "egress-rules").(*types.StringSlice).Value
+	egressRules, err := state.convertSecurityGroupRules(state.EgressRules)
+	if err != nil {
+		return state, err
+	}
+	state._egressRules = egressRules
+
 	return state, state.validate()
+}
+
+func (state *state) convertSecurityGroupRules(ruleStrings []string) ([]securityGroupRule, error) {
+	if ruleStrings == nil || len(ruleStrings) == 0 {
+		return nil, nil
+	}
+	rules := make([]securityGroupRule, len(ruleStrings))
+
+	for i, ruleString := range ruleStrings {
+		arr := strings.Split(ruleString, ":")
+		if len(arr) < 2 {
+			return nil, fmt.Errorf("invalid rule %s", ruleString)
+		}
+		protocol := arr[0]
+		if protocol != "tcp" && protocol != "udp" && protocol != "icmp" {
+			return nil, fmt.Errorf("invalid rule protocol %s", ruleString)
+		}
+		fromPort, err := strconv.ParseInt(arr[1], 10, 16)
+		if err != nil {
+			return nil, fmt.Errorf("invalid rule fromPort %s", ruleString)
+		}
+		toPort := fromPort
+		if len(arr) > 2 {
+			toPort, err = strconv.ParseInt(arr[2], 10, 16)
+			if err != nil {
+				return nil, fmt.Errorf("invalid rule toPort %s", ruleString)
+			}
+		}
+		cidrIP := "0.0.0.0/0"
+		if len(arr) > 3 {
+			if _, _, err = net.ParseCIDR(arr[3]); err != nil {
+				return nil, fmt.Errorf("invalid rule cidrIP %s", ruleString)
+			}
+			cidrIP = arr[3]
+		}
+		rules[i] = securityGroupRule{protocol, int16(fromPort), int16(toPort), cidrIP}
+	}
+
+	return rules, nil
 }
 
 func (state *state) validate() error {
@@ -606,9 +686,28 @@ func (d *Driver) Create(ctx context.Context, options *types.DriverOptions, _ *ty
 	} else {
 		publicIP = *state.AssociateWorkerNodePublicIP
 	}
+
+	var rulesString string
+	if state._ingressRules != nil && len(state._ingressRules) > 0 {
+		rulesString = ingressPrefix
+		for _, rule := range state._ingressRules {
+			nextRuleString := fmt.Sprintf(securityRuleTemplate, rule.protocol, rule.fromPort, rule.toPort, rule.cidrIP)
+			rulesString = fmt.Sprintf("%s%s", rulesString, nextRuleString)
+		}
+	} else {
+		rulesString = ""
+	}
+	if state._egressRules != nil && len(state._egressRules) > 0 {
+		rulesString = fmt.Sprintf("%s%s", rulesString, egressPrefix)
+		for _, rule := range state._egressRules {
+			nextRuleString := fmt.Sprintf(securityRuleTemplate, rule.protocol, rule.fromPort, rule.toPort, rule.cidrIP)
+			rulesString = fmt.Sprintf("%s%s", rulesString, nextRuleString)
+		}
+	}
 	// amend UserData values into template.
 	// must use %q to safely pass the string
-	workerNodesFinalTemplate := fmt.Sprintf(workerNodesTemplate, state.UserData)
+	workerNodesFinalTemplate := fmt.Sprintf(workerNodesTemplate, rulesString, state.UserData)
+	logrus.Debug(workerNodesFinalTemplate)
 
 	var volumeSize int64
 	if state.NodeVolumeSize == nil {

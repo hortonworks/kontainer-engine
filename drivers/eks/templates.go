@@ -195,6 +195,15 @@ Outputs:
     Description: The VPC Id
     Value: !Ref VPC
 `
+	ingressPrefix = `
+      SecurityGroupIngress:`
+	egressPrefix = `
+      SecurityGroupEgress:`
+	securityRuleTemplate = `
+      - IpProtocol: %s
+        FromPort: %d
+        ToPort: %d
+        CidrIp: %s`
 	workerNodesTemplate = `---
 AWSTemplateFormatVersion: '2010-09-09'
 Description: 'Amazon EKS - Node Group'
@@ -410,7 +419,7 @@ Resources:
         !Ref VpcId
       Tags:
       - Key: !Sub "kubernetes.io/cluster/${ClusterName}"
-        Value: 'owned'
+        Value: 'owned'%s
 
   NodeSecurityGroupIngress:
     Type: AWS::EC2::SecurityGroupIngress
