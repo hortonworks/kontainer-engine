@@ -73,6 +73,7 @@ type Cluster struct {
 type PersistentStore interface {
 	GetStatus(name string) (string, error)
 	Get(name string) (Cluster, error)
+	GetKubeConfig(name string) (string, error)
 	Remove(name string) error
 	Store(cluster Cluster) error
 	PersistStatus(cluster Cluster, status string) error

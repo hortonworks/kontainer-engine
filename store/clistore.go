@@ -33,22 +33,17 @@ func (c CLIPersistStore) GetStatus(name string) (string, error) {
 }
 
 func (c CLIPersistStore) Remove(name string) error {
-	config, err := getConfigFromFile()
-	if err != nil {
-		return err
-	}
+	fileDir, _ := getClusterPath(name)
+	//Remove cluster directory
+	return os.RemoveAll(fileDir)
+}
 
-	deleteConfigByName(&config, name)
-	if err := setConfigToFile(config); err != nil {
-		return err
-	}
-
-	path := filepath.Join(utils.HomeDir(), "clusters", name)
-	return os.RemoveAll(path)
+func getClusterPath(name string) ( string , error ) {
+	return filepath.Join(utils.HomeDir(), "clusters", name), nil
 }
 
 func (c CLIPersistStore) Get(name string) (cluster.Cluster, error) {
-	path := filepath.Join(utils.HomeDir(), "clusters", name)
+	path, err := getClusterPath(name)
 	if _, err := os.Stat(filepath.Join(path, defaultConfigName)); os.IsNotExist(err) {
 		return cluster.Cluster{}, fmt.Errorf("%s not found", name)
 	}
@@ -69,7 +64,7 @@ func (c CLIPersistStore) Store(cls cluster.Cluster) error {
 		return err
 	}
 	// store json config file
-	fileDir := filepath.Join(utils.HomeDir(), "clusters", cls.Name)
+	fileDir, err := getClusterPath(cls.Name)
 	for k, v := range map[string]string{
 		cls.RootCACert:        caPem,
 		cls.ClientKey:         clientKey,
@@ -109,16 +104,17 @@ func (c CLIPersistStore) SetEnv(name string) error {
 	if !ok {
 		return fmt.Errorf("cluster %v can't be found", name)
 	}
-	config, err := getConfigFromFile()
+	clusterBaseDir, err := getClusterPath(name)
+	config, err := getConfigFromFile(utils.KubeConfigFilePath(clusterBaseDir))
 	if err != nil {
 		return err
 	}
 	config.CurrentContext = name
-	if err := setConfigToFile(config); err != nil {
+	if err := setConfigToFile(utils.KubeConfigFilePath(clusterBaseDir), config); err != nil {
 		return err
 	}
 
-	configFile := utils.KubeConfigFilePath()
+	configFile := utils.KubeConfigFilePath(clusterBaseDir)
 	fmt.Printf("Current context is set to %s\n", name)
 	fmt.Printf("run `export KUBECONFIG=%v` or `--kubeconfig %s` to use the config file\n", configFile, configFile)
 	return nil
@@ -137,7 +133,8 @@ func storeConfig(c cluster.Cluster) error {
 		token = c.ServiceAccountToken
 	}
 
-	configFile := utils.KubeConfigFilePath()
+	configFilePath, err := getClusterPath(c.Name)
+	configFile := utils.KubeConfigFilePath(configFilePath)
 	config := KubeConfig{}
 	if _, err := os.Stat(configFile); err == nil {
 		data, err := ioutil.ReadFile(configFile)
@@ -150,6 +147,7 @@ func storeConfig(c cluster.Cluster) error {
 	}
 	config.APIVersion = "v1"
 	config.Kind = "Config"
+	config.CurrentContext = c.Name
 
 	// setup clusters
 	host := c.Endpoint
@@ -229,11 +227,11 @@ func storeConfig(c cluster.Cluster) error {
 	if err != nil {
 		return err
 	}
-	fileToWrite := utils.KubeConfigFilePath()
-	if err := utils.WriteToFile(data, fileToWrite); err != nil {
+
+	if err := utils.WriteToFile(data, configFile); err != nil {
 		return err
 	}
-	logrus.Debugf("KubeConfig files is saved to %s", fileToWrite)
+	logrus.Debugf("KubeConfig files is saved to %s", configFile)
 	logrus.Debug("Kubeconfig file\n" + string(data))
 
 	return nil
@@ -263,10 +261,23 @@ func deleteConfigByName(config *KubeConfig, name string) {
 	config.Users = users
 }
 
-func getConfigFromFile() (KubeConfig, error) {
-	configFile := utils.KubeConfigFilePath()
+func (c CLIPersistStore) GetKubeConfig(name string) (string, error) {
+	fileDir, err := getClusterPath(name)
+	kubeConfigPath := utils.KubeConfigFilePath(fileDir)
+	data, err := getRawKubeConfig(kubeConfigPath)
+	if err != nil {
+		return "", err
+	}
+	return string(data), err
+}
+
+func getRawKubeConfig(filepath string) ([]byte, error) {
+	return ioutil.ReadFile(filepath)
+}
+
+func getConfigFromFile(filepath string) (KubeConfig, error) {
 	config := KubeConfig{}
-	data, err := ioutil.ReadFile(configFile)
+	data, err:= getRawKubeConfig(filepath)
 	if err != nil {
 		return KubeConfig{}, err
 	}
@@ -276,10 +287,10 @@ func getConfigFromFile() (KubeConfig, error) {
 	return config, nil
 }
 
-func setConfigToFile(config KubeConfig) error {
+func setConfigToFile(filepath string, config KubeConfig) error {
 	data, err := yaml.Marshal(config)
 	if err != nil {
 		return err
 	}
-	return utils.WriteToFile(data, utils.KubeConfigFilePath())
+	return utils.WriteToFile(data, filepath)
 }

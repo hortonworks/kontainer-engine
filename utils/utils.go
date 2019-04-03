@@ -51,6 +51,10 @@ func HomeDir() string {
 	return filepath.Join(homeDir, ".kontainer")
 }
 
-func KubeConfigFilePath() string {
-	return filepath.Join(HomeDir(), defaultFileName)
+func KubeConfigFilePath(basePath string) string {
+	return filepath.Join(basePath, defaultFileName)
+}
+
+func DefaultKubeConfigFilePath() string {
+	return filepath.Join(HomeDir(),  defaultFileName)
 }
