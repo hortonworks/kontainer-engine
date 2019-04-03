@@ -113,6 +113,8 @@ type state struct {
 	_ingressRules []securityGroupRule
 	_egressRules []securityGroupRule
 
+	Tags map[string]string
+
 	ClusterInfo types.ClusterInfo
 }
 
@@ -262,6 +264,11 @@ func (d *Driver) GetDriverCreateOptions(ctx context.Context) (*types.DriverFlags
 		Default: &types.Default{DefaultString: "1.10"},
 	}
 
+	driverFlag.Options["tags"] = &types.Flag{
+		Type:  types.StringSliceType,
+		Usage: "Tags for Kubernetes cluster. For example, foo=bar.",
+	}
+
 	return &driverFlag, nil
 }
 
@@ -329,6 +336,15 @@ func getStateFromOptions(driverOptions *types.DriverOptions) (state, error) {
 		return state, err
 	}
 	state._egressRules = egressRules
+
+	state.Tags = make(map[string]string)
+	tagValues := options.GetValueFromDriverOptions(driverOptions, types.StringSliceType, "tags").(*types.StringSlice)
+	for _, part := range tagValues.Value {
+		kv := strings.Split(part, "=")
+		if len(kv) == 2 {
+			state.Tags[kv[0]] = kv[1]
+		}
+	}
 
 	return state, state.validate()
 }
@@ -452,16 +468,14 @@ func alreadyExistsInCloudFormationError(err error) bool {
 	return false
 }
 
-func (d *Driver) createStack(svc *cloudformation.CloudFormation, name string, displayName string,
+func (d *Driver) createStack(svc *cloudformation.CloudFormation, name string, tags []*cloudformation.Tag,
 	templateBody string, capabilities []string, parameters []*cloudformation.Parameter) (*cloudformation.DescribeStacksOutput, error) {
 	_, err := svc.CreateStack(&cloudformation.CreateStackInput{
 		StackName:    aws.String(name),
 		TemplateBody: aws.String(templateBody),
 		Capabilities: aws.StringSlice(capabilities),
 		Parameters:   parameters,
-		Tags: []*cloudformation.Tag{
-			{Key: aws.String("displayName"), Value: aws.String(displayName)},
-		},
+		Tags: tags,
 	})
 	if err != nil && !alreadyExistsInCloudFormationError(err) {
 		return nil, fmt.Errorf("error creating master: %v", err)
@@ -562,13 +576,23 @@ func (d *Driver) Create(ctx context.Context, options *types.DriverOptions, _ *ty
 
 	displayName := state.DisplayName
 
+	tags := []*cloudformation.Tag{}
+	tag := &cloudformation.Tag{Key: aws.String("displayName"), Value: aws.String(displayName)}
+	tags = append(tags,tag)
+	for key, val := range state.Tags {
+		if val != "" {
+			tag := &cloudformation.Tag{Key: aws.String(key), Value: aws.String(val)}
+			tags = append(tags, tag)
+		}
+	}
+
 	var vpcid string
 	var subnetIds []*string
 	var securityGroups []*string
 	if state.VirtualNetwork == "" {
 		logrus.Infof("Bringing up vpc:%s", getVPCStackName(state.DisplayName))
 
-		stack, err := d.createStack(svc, getVPCStackName(state.DisplayName), displayName, vpcTemplate, []string{},
+		stack, err := d.createStack(svc, getVPCStackName(state.DisplayName), tags, vpcTemplate, []string{},
 			[]*cloudformation.Parameter{})
 		if err != nil {
 			return info, fmt.Errorf("error creating stack: %v", err)
@@ -609,7 +633,7 @@ func (d *Driver) Create(ctx context.Context, options *types.DriverOptions, _ *ty
 	if state.ServiceRole == "" {
 		logrus.Infof("Creating service role")
 
-		stack, err := d.createStack(svc, getServiceRoleName(state.DisplayName), displayName, serviceRoleTemplate,
+		stack, err := d.createStack(svc, getServiceRoleName(state.DisplayName), tags, serviceRoleTemplate,
 			[]string{cloudformation.CapabilityCapabilityIam}, nil)
 		if err != nil {
 			return info, fmt.Errorf("error creating stack: %v", err)
@@ -716,7 +740,7 @@ func (d *Driver) Create(ctx context.Context, options *types.DriverOptions, _ *ty
 		volumeSize = *state.NodeVolumeSize
 	}
 
-	stack, err := d.createStack(svc, getWorkNodeName(state.DisplayName), displayName, workerNodesFinalTemplate,
+	stack, err := d.createStack(svc, getWorkNodeName(state.DisplayName), tags, workerNodesFinalTemplate,
 		[]string{cloudformation.CapabilityCapabilityIam},
 		[]*cloudformation.Parameter{
 			{ParameterKey: aws.String("ClusterName"), ParameterValue: aws.String(state.DisplayName)},
