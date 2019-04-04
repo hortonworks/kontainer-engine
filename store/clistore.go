@@ -39,7 +39,7 @@ func (c CLIPersistStore) Remove(name string) error {
 }
 
 func getClusterPath(name string) ( string , error ) {
-	return filepath.Join(utils.HomeDir(), "clusters", name), nil
+	return filepath.Join(utils.ClusterStoreDir(), name), nil
 }
 
 func (c CLIPersistStore) Get(name string) (cluster.Cluster, error) {
@@ -86,7 +86,10 @@ func (c CLIPersistStore) Store(cls cluster.Cluster) error {
 }
 
 func (c CLIPersistStore) PersistStatus(cluster cluster.Cluster, status string) error {
-	fileDir := filepath.Join(utils.HomeDir(), "clusters", cluster.Name)
+	fileDir, err := getClusterPath(cluster.Name)
+	if err != nil {
+		return err
+	}
 	cluster.Status = status
 	data, err := json.Marshal(cluster)
 	if err != nil {
