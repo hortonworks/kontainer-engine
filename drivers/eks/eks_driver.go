@@ -115,6 +115,8 @@ type state struct {
 
 	Tags map[string]string
 
+	KeyPairName string
+
 	ClusterInfo types.ClusterInfo
 }
 
@@ -269,6 +271,11 @@ func (d *Driver) GetDriverCreateOptions(ctx context.Context) (*types.DriverFlags
 		Usage: "Tags for Kubernetes cluster. For example, foo=bar.",
 	}
 
+	driverFlag.Options["key-pair-name"] = &types.Flag{
+		Type:  types.StringType,
+		Usage: "The ssh key pair to use",
+	}
+
 	return &driverFlag, nil
 }
 
@@ -345,6 +352,8 @@ func getStateFromOptions(driverOptions *types.DriverOptions) (state, error) {
 			state.Tags[kv[0]] = kv[1]
 		}
 	}
+
+	state.KeyPairName = options.GetValueFromDriverOptions(driverOptions, types.StringType, "key-pair-name", "keyPairName").(string)
 
 	return state, state.validate()
 }
@@ -631,7 +640,7 @@ func (d *Driver) Create(ctx context.Context, options *types.DriverOptions, _ *ty
 
 	var roleARN string
 	if state.ServiceRole == "" {
-		logrus.Infof("Creating service role")
+		logrus.Infof("Creating service role:%s", getServiceRoleName(state.DisplayName))
 
 		stack, err := d.createStack(svc, getServiceRoleName(state.DisplayName), tags, serviceRoleTemplate,
 			[]string{cloudformation.CapabilityCapabilityIam}, nil)
@@ -684,13 +693,21 @@ func (d *Driver) Create(ctx context.Context, options *types.DriverOptions, _ *ty
 		return info, fmt.Errorf("error parsing CA data: %v", err)
 	}
 
+	var keyPairName string
 	ec2svc := ec2.New(sess)
-	keyPairName := getEC2KeyPairName(state.DisplayName)
-	_, err = ec2svc.CreateKeyPair(&ec2.CreateKeyPairInput{
-		KeyName: aws.String(keyPairName),
-	})
-	if err != nil && !isDuplicateKeyError(err) {
-		return info, fmt.Errorf("error creating key pair %v", err)
+	if state.KeyPairName == "" {
+		keyPairName = getEC2KeyPairName(state.DisplayName)
+		logrus.Infof("Creating KeyPair:%s", keyPairName)
+		_, err = ec2svc.CreateKeyPair(&ec2.CreateKeyPairInput{
+			KeyName: aws.String(keyPairName),
+		})
+		if err != nil && !isDuplicateKeyError(err) {
+			return info, fmt.Errorf("error creating key pair %v", err)
+		}
+
+	} else {
+		logrus.Infof("KeyPair name is provided, skipping create")
+		keyPairName = state.KeyPairName
 	}
 
 	logrus.Infof("Creating worker nodes! Stack-name: %s", getWorkNodeName(state.DisplayName))
