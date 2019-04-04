@@ -122,8 +122,8 @@ type state struct {
 
 type securityGroupRule struct {
 	protocol string
-	fromPort int16
-	toPort int16
+	fromPort uint16
+	toPort uint16
 	cidrIP string
 }
 
@@ -373,13 +373,13 @@ func (state *state) convertSecurityGroupRules(ruleStrings []string) ([]securityG
 		if protocol != "tcp" && protocol != "udp" && protocol != "icmp" {
 			return nil, fmt.Errorf("invalid rule protocol %s", ruleString)
 		}
-		fromPort, err := strconv.ParseInt(arr[1], 10, 16)
+		fromPort, err := strconv.ParseUint(arr[1], 10, 16)
 		if err != nil {
 			return nil, fmt.Errorf("invalid rule fromPort %s", ruleString)
 		}
 		toPort := fromPort
 		if len(arr) > 2 {
-			toPort, err = strconv.ParseInt(arr[2], 10, 16)
+			toPort, err = strconv.ParseUint(arr[2], 10, 16)
 			if err != nil {
 				return nil, fmt.Errorf("invalid rule toPort %s", ruleString)
 			}
@@ -391,7 +391,7 @@ func (state *state) convertSecurityGroupRules(ruleStrings []string) ([]securityG
 			}
 			cidrIP = arr[3]
 		}
-		rules[i] = securityGroupRule{protocol, int16(fromPort), int16(toPort), cidrIP}
+		rules[i] = securityGroupRule{protocol, uint16(fromPort), uint16(toPort), cidrIP}
 	}
 
 	return rules, nil
