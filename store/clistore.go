@@ -264,6 +264,9 @@ func deleteConfigByName(config *KubeConfig, name string) {
 func (c CLIPersistStore) GetKubeConfig(name string) (string, error) {
 	fileDir, err := getClusterPath(name)
 	kubeConfigPath := utils.KubeConfigFilePath(fileDir)
+	if _, err := os.Stat(kubeConfigPath); os.IsNotExist(err) {
+		return "", fmt.Errorf("%s not found", name)
+	}
 	data, err := getRawKubeConfig(kubeConfigPath)
 	if err != nil {
 		return "", err
