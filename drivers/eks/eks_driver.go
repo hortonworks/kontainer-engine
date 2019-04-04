@@ -110,9 +110,6 @@ type state struct {
 	IngressRules []string
 	EgressRules []string
 
-	_ingressRules []securityGroupRule
-	_egressRules []securityGroupRule
-
 	Tags map[string]string
 
 	KeyPairName string
@@ -332,17 +329,7 @@ func getStateFromOptions(driverOptions *types.DriverOptions) (state, error) {
 	state.UserData = options.GetValueFromDriverOptions(driverOptions, types.StringType, "user-data", "userData").(string)
 
 	state.IngressRules = options.GetValueFromDriverOptions(driverOptions, types.StringSliceType, "ingress-rules").(*types.StringSlice).Value
-	ingressRules, err := state.convertSecurityGroupRules(state.IngressRules)
-	if err != nil {
-		return state, err
-	}
-	state._ingressRules = ingressRules
 	state.EgressRules = options.GetValueFromDriverOptions(driverOptions, types.StringSliceType, "egress-rules").(*types.StringSlice).Value
-	egressRules, err := state.convertSecurityGroupRules(state.EgressRules)
-	if err != nil {
-		return state, err
-	}
-	state._egressRules = egressRules
 
 	state.Tags = make(map[string]string)
 	tagValues := options.GetValueFromDriverOptions(driverOptions, types.StringSliceType, "tags").(*types.StringSlice)
@@ -358,7 +345,7 @@ func getStateFromOptions(driverOptions *types.DriverOptions) (state, error) {
 	return state, state.validate()
 }
 
-func (state *state) convertSecurityGroupRules(ruleStrings []string) ([]securityGroupRule, error) {
+func convertSecurityGroupRules(ruleStrings []string) ([]securityGroupRule, error) {
 	if ruleStrings == nil || len(ruleStrings) == 0 {
 		return nil, nil
 	}
@@ -538,6 +525,82 @@ func (d *Driver) createStack(svc *cloudformation.CloudFormation, name string, ta
 	return stack, nil
 }
 
+func (d *Driver) changeStack(svc *cloudformation.CloudFormation, changeSetName string, name string, tags []*cloudformation.Tag,
+	templateBody string, capabilities []string, parameters []*cloudformation.Parameter) error {
+
+	_, err := svc.CreateChangeSet(&cloudformation.CreateChangeSetInput{
+		ChangeSetName: aws.String(changeSetName),
+		StackName:    aws.String(name),
+		TemplateBody: aws.String(templateBody),
+		Capabilities: aws.StringSlice(capabilities),
+		Parameters:   parameters,
+		Tags: tags,
+	})
+	if err != nil {
+		return fmt.Errorf("error creating change set: %v", err)
+	}
+
+	status := "CREATE_IN_PROGRESS"
+	var desc *cloudformation.DescribeChangeSetOutput
+	for status == "CREATE_IN_PROGRESS" {
+		time.Sleep(time.Second * 10)
+		desc, err = svc.DescribeChangeSet(&cloudformation.DescribeChangeSetInput{
+			ChangeSetName: aws.String(changeSetName),
+			StackName:    aws.String(name),
+		})
+		if err != nil {
+			return d.cleanupChangeSet(svc, changeSetName, name, fmt.Errorf("error polling change set status: %v", err))
+		}
+		status = *desc.Status
+	}
+
+	if status != "CREATE_COMPLETE" {
+		reason := desc.StatusReason
+		return d.cleanupChangeSet(svc, changeSetName, name, fmt.Errorf("change set creation failed: %v", reason))
+	}
+	logrus.Infof("Change set description:\n%s\n", desc)
+
+	_, err = svc.ExecuteChangeSet(&cloudformation.ExecuteChangeSetInput{
+		ChangeSetName: aws.String(changeSetName),
+		StackName:    aws.String(name),
+	})
+	if err != nil {
+		return d.cleanupChangeSet(svc, changeSetName, name, fmt.Errorf("error executing change set: %v", err))
+	}
+
+	var stack *cloudformation.DescribeStacksOutput
+	status = "UPDATE_IN_PROGRESS"
+	for status == "UPDATE_IN_PROGRESS" {
+		time.Sleep(time.Second * 10)
+		stack, err = svc.DescribeStacks(&cloudformation.DescribeStacksInput{
+			StackName: aws.String(name),
+		})
+		if err != nil {
+			return fmt.Errorf("error polling stack info: %v", err)
+		}
+
+		status = *stack.Stacks[0].StackStatus
+	}
+
+	if status != "UPDATE_COMPLETE" {
+		return fmt.Errorf("change set execution failed: %s", status)
+	}
+
+	return nil
+}
+
+func (d *Driver) cleanupChangeSet(svc *cloudformation.CloudFormation, changeSetName string, name string, err error) error {
+	_, err2 := svc.DeleteChangeSet(&cloudformation.DeleteChangeSetInput{
+		ChangeSetName: aws.String(changeSetName),
+		StackName:    aws.String(name),
+	})
+	if err2 == nil {
+		return fmt.Errorf("%v", err)
+	} else {
+		return fmt.Errorf("%v\nand couldn't delete change set %v", err, err2)
+	}
+}
+
 func toStringPointerSlice(strings []string) []*string {
 	var stringPointers []*string
 
@@ -567,7 +630,7 @@ func (d *Driver) Create(ctx context.Context, options *types.DriverOptions, _ *ty
 	}
 
 	info := &types.ClusterInfo{}
-	storeState(info, state)
+	storeState(info, state) // store state here and after initialization
 
 	sess, err := session.NewSession(&aws.Config{
 		Region: aws.String(state.Region),
@@ -583,120 +646,26 @@ func (d *Driver) Create(ctx context.Context, options *types.DriverOptions, _ *ty
 
 	svc := cloudformation.New(sess)
 
-	displayName := state.DisplayName
+	tags := getTags(state)
 
-	tags := []*cloudformation.Tag{}
-	tag := &cloudformation.Tag{Key: aws.String("displayName"), Value: aws.String(displayName)}
-	tags = append(tags,tag)
-	for key, val := range state.Tags {
-		if val != "" {
-			tag := &cloudformation.Tag{Key: aws.String(key), Value: aws.String(val)}
-			tags = append(tags, tag)
-		}
-	}
-
-	var vpcid string
-	var subnetIds []*string
-	var securityGroups []*string
-	if state.VirtualNetwork == "" {
-		logrus.Infof("Bringing up vpc:%s", getVPCStackName(state.DisplayName))
-
-		stack, err := d.createStack(svc, getVPCStackName(state.DisplayName), tags, vpcTemplate, []string{},
-			[]*cloudformation.Parameter{})
-		if err != nil {
-			return info, fmt.Errorf("error creating stack: %v", err)
-		}
-
-		securityGroupsString := getParameterValueFromOutput("SecurityGroups", stack.Stacks[0].Outputs)
-		subnetIdsString := getParameterValueFromOutput("SubnetIds", stack.Stacks[0].Outputs)
-
-		if securityGroupsString == "" || subnetIdsString == "" {
-			return info, fmt.Errorf("no security groups or subnet ids were returned")
-		}
-
-		securityGroups = toStringPointerSlice(strings.Split(securityGroupsString, ","))
-		subnetIds = toStringPointerSlice(strings.Split(subnetIdsString, ","))
-
-		resources, err := svc.DescribeStackResources(&cloudformation.DescribeStackResourcesInput{
-			StackName: aws.String(state.DisplayName + "-eks-vpc"),
-		})
-		if err != nil {
-			return info, fmt.Errorf("error getting stack resoures")
-		}
-
-		for _, resource := range resources.StackResources {
-			logrus.Infof("LogicalResourceId: %s PhysicalResourceId: %s",*resource.LogicalResourceId, *resource.PhysicalResourceId)
-			if *resource.LogicalResourceId == "VPC" {
-				vpcid = *resource.PhysicalResourceId
-			}
-		}
-	} else {
-		logrus.Infof("VPC info provided, skipping create")
-
-		vpcid = state.VirtualNetwork
-		subnetIds = toStringPointerSlice(state.Subnets)
-		securityGroups = toStringPointerSlice(state.SecurityGroups)
-	}
-
-	var roleARN string
-	if state.ServiceRole == "" {
-		logrus.Infof("Creating service role:%s", getServiceRoleName(state.DisplayName))
-
-		stack, err := d.createStack(svc, getServiceRoleName(state.DisplayName), tags, serviceRoleTemplate,
-			[]string{cloudformation.CapabilityCapabilityIam}, nil)
-		if err != nil {
-			return info, fmt.Errorf("error creating stack: %v", err)
-		}
-
-		roleARN = getParameterValueFromOutput("RoleArn", stack.Stacks[0].Outputs)
-		if roleARN == "" {
-			return info, fmt.Errorf("no RoleARN was returned")
-		}
-	} else {
-		logrus.Infof("Retrieving existing service role")
-		iamClient := iam.New(sess, aws.NewConfig().WithRegion(state.Region))
-		role, err := iamClient.GetRole(&iam.GetRoleInput{
-			RoleName: aws.String(state.ServiceRole),
-		})
-		if err != nil {
-			return info, fmt.Errorf("error getting role: %v", err)
-		}
-
-		roleARN = *role.Role.Arn
-	}
-
-	logrus.Infof("Creating EKS cluster: %s", state.DisplayName)
-
-	eksService := eks.New(sess)
-	_, err = eksService.CreateCluster(&eks.CreateClusterInput{
-		Name:    aws.String(state.DisplayName),
-		RoleArn: aws.String(roleARN),
-		ResourcesVpcConfig: &eks.VpcConfigRequest{
-			SecurityGroupIds: securityGroups,
-			SubnetIds:        subnetIds,
-		},
-		Version: aws.String(state.KubernetesVersion),
-	})
-	if err != nil && !isClusterConflict(err) {
-		return info, fmt.Errorf("error creating cluster: %v", err)
-	}
-
-	cluster, err := d.waitForClusterReady(eksService, state)
+	err = d.initVpc(svc, &state, tags)
 	if err != nil {
 		return info, err
 	}
 
-	logrus.Infof("Cluster %s provisioned successfully", state.DisplayName)
+	cluster, err := d.initCluster(svc, sess, &state, tags)
+	if err != nil {
+		return info, err
+	}
 
 	capem, err := base64.StdEncoding.DecodeString(*cluster.Cluster.CertificateAuthority.Data)
 	if err != nil {
 		return info, fmt.Errorf("error parsing CA data: %v", err)
 	}
 
-	var keyPairName string
 	ec2svc := ec2.New(sess)
 	if state.KeyPairName == "" {
-		keyPairName = getEC2KeyPairName(state.DisplayName)
+		keyPairName := getEC2KeyPairName(state.DisplayName)
 		logrus.Infof("Creating KeyPair:%s", keyPairName)
 		_, err = ec2svc.CreateKeyPair(&ec2.CreateKeyPairInput{
 			KeyName: aws.String(keyPairName),
@@ -704,83 +673,37 @@ func (d *Driver) Create(ctx context.Context, options *types.DriverOptions, _ *ty
 		if err != nil && !isDuplicateKeyError(err) {
 			return info, fmt.Errorf("error creating key pair %v", err)
 		}
-
+		state.KeyPairName = keyPairName
 	} else {
 		logrus.Infof("KeyPair name is provided, skipping create")
-		keyPairName = state.KeyPairName
+	}
+
+	if state.AMI == "" {
+		//should be always accessible after validate()
+		state.AMI = getAMIs(ctx, ec2svc, state)
+	}
+
+	if state.AssociateWorkerNodePublicIP == nil {
+		b := true
+		state.AssociateWorkerNodePublicIP = &b
+	}
+
+	if state.NodeVolumeSize == nil {
+		var volumeSize int64 = 20
+		state.NodeVolumeSize = &volumeSize
+	}
+
+	storeState(info, state) // store state again now that initialization is complete
+
+	workerNodesFinalTemplate, workerParameters, err := getWorkerParameters(state)
+	if err != nil {
+		return info, err
 	}
 
 	logrus.Infof("Creating worker nodes! Stack-name: %s", getWorkNodeName(state.DisplayName))
-
-	var amiID string
-	if state.AMI != "" {
-		amiID = state.AMI
-	} else {
-		//should be always accessible after validate()
-		amiID = getAMIs(ctx, ec2svc, state)
-
-	}
-
-	var publicIP bool
-	if state.AssociateWorkerNodePublicIP == nil {
-		publicIP = true
-	} else {
-		publicIP = *state.AssociateWorkerNodePublicIP
-	}
-
-	var rulesString string
-	if state._ingressRules != nil && len(state._ingressRules) > 0 {
-		rulesString = ingressPrefix
-		for _, rule := range state._ingressRules {
-			nextRuleString := fmt.Sprintf(securityRuleTemplate, rule.protocol, rule.fromPort, rule.toPort, rule.cidrIP)
-			rulesString = fmt.Sprintf("%s%s", rulesString, nextRuleString)
-		}
-	} else {
-		rulesString = ""
-	}
-	if state._egressRules != nil && len(state._egressRules) > 0 {
-		rulesString = fmt.Sprintf("%s%s", rulesString, egressPrefix)
-		for _, rule := range state._egressRules {
-			nextRuleString := fmt.Sprintf(securityRuleTemplate, rule.protocol, rule.fromPort, rule.toPort, rule.cidrIP)
-			rulesString = fmt.Sprintf("%s%s", rulesString, nextRuleString)
-		}
-	}
-	// amend UserData values into template.
-	// must use %q to safely pass the string
-	workerNodesFinalTemplate := fmt.Sprintf(workerNodesTemplate, rulesString, state.UserData)
-	logrus.Debug(workerNodesFinalTemplate)
-
-	var volumeSize int64
-	if state.NodeVolumeSize == nil {
-		volumeSize = 20
-	} else {
-		volumeSize = *state.NodeVolumeSize
-	}
-
 	stack, err := d.createStack(svc, getWorkNodeName(state.DisplayName), tags, workerNodesFinalTemplate,
 		[]string{cloudformation.CapabilityCapabilityIam},
-		[]*cloudformation.Parameter{
-			{ParameterKey: aws.String("ClusterName"), ParameterValue: aws.String(state.DisplayName)},
-			{ParameterKey: aws.String("ClusterControlPlaneSecurityGroup"),
-				ParameterValue: aws.String(strings.Join(toStringLiteralSlice(securityGroups), ","))},
-			{ParameterKey: aws.String("NodeGroupName"),
-				ParameterValue: aws.String(state.DisplayName + "-node-group")},
-			{ParameterKey: aws.String("NodeAutoScalingGroupDesiredCapacity"), ParameterValue: aws.String(strconv.Itoa(
-				int(state.InstanceCount)))},
-			{ParameterKey: aws.String("NodeAutoScalingGroupMinSize"), ParameterValue: aws.String(strconv.Itoa(
-				int(state.MinimumASGSize)))},
-			{ParameterKey: aws.String("NodeAutoScalingGroupMaxSize"), ParameterValue: aws.String(strconv.Itoa(
-				int(state.MaximumASGSize)))},
-			{ParameterKey: aws.String("NodeVolumeSize"), ParameterValue: aws.String(strconv.Itoa(
-				int(volumeSize)))},
-			{ParameterKey: aws.String("NodeInstanceType"), ParameterValue: aws.String(state.InstanceType)},
-			{ParameterKey: aws.String("NodeImageId"), ParameterValue: aws.String(amiID)},
-			{ParameterKey: aws.String("KeyName"), ParameterValue: aws.String(keyPairName)}, // TODO let the user specify this
-			{ParameterKey: aws.String("VpcId"), ParameterValue: aws.String(vpcid)},
-			{ParameterKey: aws.String("Subnets"),
-				ParameterValue: aws.String(strings.Join(toStringLiteralSlice(subnetIds), ","))},
-			{ParameterKey: aws.String("PublicIp"), ParameterValue: aws.String(strconv.FormatBool(publicIP))},
-		})
+		workerParameters)
 	if err != nil {
 		return info, fmt.Errorf("error creating stack: %v", err)
 	}
@@ -793,6 +716,231 @@ func (d *Driver) Create(ctx context.Context, options *types.DriverOptions, _ *ty
 	err = d.createConfigMap(state, *cluster.Cluster.Endpoint, capem, nodeInstanceRole)
 	if err != nil {
 		return info, err
+	}
+
+	return info, nil
+}
+
+func getTags(state state) []*cloudformation.Tag {
+	tags := []*cloudformation.Tag{}
+	tag := &cloudformation.Tag{Key: aws.String("displayName"), Value: aws.String(state.DisplayName)}
+	tags = append(tags,tag)
+	for key, val := range state.Tags {
+		if val != "" {
+			tag := &cloudformation.Tag{Key: aws.String(key), Value: aws.String(val)}
+			tags = append(tags, tag)
+		}
+	}
+	return tags
+}
+
+func (d *Driver) initVpc(svc *cloudformation.CloudFormation, state *state, tags []*cloudformation.Tag) error {
+	if state.VirtualNetwork != "" {
+		logrus.Infof("VPC info provided, skipping create")
+		return nil
+	}
+
+	logrus.Infof("Bringing up vpc:%s", getVPCStackName(state.DisplayName))
+
+	stack, err := d.createStack(svc, getVPCStackName(state.DisplayName), tags, vpcTemplate, []string{},
+		[]*cloudformation.Parameter{})
+	if err != nil {
+		return fmt.Errorf("error creating stack: %v", err)
+	}
+
+	securityGroupsString := getParameterValueFromOutput("SecurityGroups", stack.Stacks[0].Outputs)
+	subnetIdsString := getParameterValueFromOutput("SubnetIds", stack.Stacks[0].Outputs)
+
+	if securityGroupsString == "" || subnetIdsString == "" {
+		return fmt.Errorf("no security groups or subnet ids were returned")
+	}
+
+	state.SecurityGroups = strings.Split(securityGroupsString, ",")
+	state.Subnets = strings.Split(subnetIdsString, ",")
+
+	resources, err := svc.DescribeStackResources(&cloudformation.DescribeStackResourcesInput{
+		StackName: aws.String(state.DisplayName + "-eks-vpc"),
+	})
+	if err != nil {
+		return fmt.Errorf("error getting stack resoures")
+	}
+
+	for _, resource := range resources.StackResources {
+		logrus.Infof("LogicalResourceId: %s PhysicalResourceId: %s",*resource.LogicalResourceId, *resource.PhysicalResourceId)
+		if *resource.LogicalResourceId == "VPC" {
+			state.VirtualNetwork = *resource.PhysicalResourceId
+		}
+	}
+	return nil
+}
+
+func (d *Driver) initRoleARN(svc *cloudformation.CloudFormation, sess *session.Session, state *state, tags []*cloudformation.Tag) (string, error) {
+	var roleARN string
+	if state.ServiceRole == "" {
+		logrus.Infof("Creating service role:%s", getServiceRoleName(state.DisplayName))
+
+		stack, err := d.createStack(svc, getServiceRoleName(state.DisplayName), tags, serviceRoleTemplate,
+			[]string{cloudformation.CapabilityCapabilityIam}, nil)
+		if err != nil {
+			return "", fmt.Errorf("error creating stack: %v", err)
+		}
+
+		roleARN = getParameterValueFromOutput("RoleArn", stack.Stacks[0].Outputs)
+		if roleARN == "" {
+			return "", fmt.Errorf("no RoleARN was returned")
+		}
+		state.ServiceRole = *stack.Stacks[0].StackName
+	} else {
+		logrus.Infof("Retrieving existing service role")
+		iamClient := iam.New(sess, aws.NewConfig().WithRegion(state.Region))
+		role, err := iamClient.GetRole(&iam.GetRoleInput{
+			RoleName: aws.String(state.ServiceRole),
+		})
+		if err != nil {
+			return "", fmt.Errorf("error getting role: %v", err)
+		}
+
+		roleARN = *role.Role.Arn
+	}
+	return roleARN, nil
+}
+
+func (d *Driver) initCluster(svc *cloudformation.CloudFormation, sess *session.Session, state *state, tags []*cloudformation.Tag) (*eks.DescribeClusterOutput, error) {
+	roleARN, err := d.initRoleARN(svc, sess, state, tags)
+	if err != nil {
+		return nil, err
+	}
+
+	logrus.Infof("Creating EKS cluster: %s", state.DisplayName)
+
+	eksService := eks.New(sess)
+	_, err = eksService.CreateCluster(&eks.CreateClusterInput{
+		Name:    aws.String(state.DisplayName),
+		RoleArn: aws.String(roleARN),
+		ResourcesVpcConfig: &eks.VpcConfigRequest{
+			SecurityGroupIds: toStringPointerSlice(state.SecurityGroups),
+			SubnetIds:        toStringPointerSlice(state.Subnets),
+		},
+		Version: aws.String(state.KubernetesVersion),
+	})
+	if err != nil && !isClusterConflict(err) {
+		return nil, fmt.Errorf("error creating cluster: %v", err)
+	}
+
+	cluster, err := d.waitForClusterReady(eksService, *state)
+	if err != nil {
+		return nil, err
+	}
+
+	logrus.Infof("Cluster %s provisioned successfully", state.DisplayName)
+
+	return cluster, nil
+}
+
+func getWorkerParameters(state state) (string, []*cloudformation.Parameter, error) {
+	ingressRules, err := convertSecurityGroupRules(state.IngressRules)
+	if err != nil {
+		return "", nil, err
+	}
+	egressRules, err := convertSecurityGroupRules(state.EgressRules)
+	if err != nil {
+		return "", nil, err
+	}
+
+	var rulesString string
+	if ingressRules != nil && len(ingressRules) > 0 {
+		rulesString = ingressPrefix
+		for _, rule := range ingressRules {
+			nextRuleString := fmt.Sprintf(securityRuleTemplate, rule.protocol, rule.fromPort, rule.toPort, rule.cidrIP)
+			rulesString = fmt.Sprintf("%s%s", rulesString, nextRuleString)
+		}
+	} else {
+		rulesString = ""
+	}
+	if egressRules != nil && len(egressRules) > 0 {
+		rulesString = fmt.Sprintf("%s%s", rulesString, egressPrefix)
+		for _, rule := range egressRules {
+			nextRuleString := fmt.Sprintf(securityRuleTemplate, rule.protocol, rule.fromPort, rule.toPort, rule.cidrIP)
+			rulesString = fmt.Sprintf("%s%s", rulesString, nextRuleString)
+		}
+	}
+	// amend UserData values into template.
+	// must use %q to safely pass the string
+	workerNodesFinalTemplate := fmt.Sprintf(workerNodesTemplate, rulesString, state.UserData)
+	logrus.Debug(workerNodesFinalTemplate)
+
+	return workerNodesFinalTemplate, []*cloudformation.Parameter{
+		{ParameterKey: aws.String("ClusterName"), ParameterValue: aws.String(state.DisplayName)},
+		{ParameterKey: aws.String("ClusterControlPlaneSecurityGroup"),
+			ParameterValue: aws.String(strings.Join(state.SecurityGroups, ","))},
+		{ParameterKey: aws.String("NodeGroupName"),
+			ParameterValue: aws.String(state.DisplayName + "-node-group")},
+		{ParameterKey: aws.String("NodeAutoScalingGroupDesiredCapacity"), ParameterValue: aws.String(strconv.Itoa(
+			int(state.InstanceCount)))},
+		{ParameterKey: aws.String("NodeAutoScalingGroupMinSize"), ParameterValue: aws.String(strconv.Itoa(
+			int(state.MinimumASGSize)))},
+		{ParameterKey: aws.String("NodeAutoScalingGroupMaxSize"), ParameterValue: aws.String(strconv.Itoa(
+			int(state.MaximumASGSize)))},
+		{ParameterKey: aws.String("NodeVolumeSize"), ParameterValue: aws.String(strconv.Itoa(
+			int(*state.NodeVolumeSize)))},
+		{ParameterKey: aws.String("NodeInstanceType"), ParameterValue: aws.String(state.InstanceType)},
+		{ParameterKey: aws.String("NodeImageId"), ParameterValue: aws.String(state.AMI)},
+		{ParameterKey: aws.String("KeyName"), ParameterValue: aws.String(getEC2KeyPairName(state.DisplayName))}, // TODO let the user specify this
+		{ParameterKey: aws.String("VpcId"), ParameterValue: aws.String(state.VirtualNetwork)},
+		{ParameterKey: aws.String("Subnets"),
+			ParameterValue: aws.String(strings.Join(state.Subnets, ","))},
+		{ParameterKey: aws.String("PublicIp"), ParameterValue: aws.String(strconv.FormatBool(*state.AssociateWorkerNodePublicIP))},
+	}, nil
+}
+
+func (d *Driver) changeWorkers(ctx context.Context, info *types.ClusterInfo, state state) (*types.ClusterInfo, error) {
+	logrus.Infof("New State Info %+v", state)
+
+	sess, err := session.NewSession(&aws.Config{
+		Region: aws.String(state.Region),
+		Credentials: credentials.NewStaticCredentials(
+			state.ClientID,
+			state.ClientSecret,
+			state.SessionToken,
+		),
+	})
+	if err != nil {
+		return info, fmt.Errorf("error getting new aws session: %v", err)
+	}
+
+	svc := cloudformation.New(sess)
+
+	tags := getTags(state)
+
+	if state.VirtualNetwork == "" {
+		return info, fmt.Errorf("virtual network should already be set")
+	}
+
+	if state.AMI == "" {
+		return info, fmt.Errorf("AMI should already be set")
+	}
+
+	if state.AssociateWorkerNodePublicIP == nil {
+		b := true
+		state.AssociateWorkerNodePublicIP = &b
+	}
+
+	if state.NodeVolumeSize == nil {
+		var volumeSize int64 = 20
+		state.NodeVolumeSize = &volumeSize
+	}
+
+	workerNodesFinalTemplate, workerParameters, err := getWorkerParameters(state)
+	if err != nil {
+		return info, err
+	}
+
+	logrus.Infof("Changing worker nodes! Stack-name: %s", getWorkNodeName(state.DisplayName))
+	err = d.changeStack(svc, getChangeSetName(state.DisplayName), getWorkNodeName(state.DisplayName), tags, workerNodesFinalTemplate,
+		[]string{cloudformation.CapabilityCapabilityIam},
+		workerParameters)
+	if err != nil {
+		return info, fmt.Errorf("error changing stack: %v", err)
 	}
 
 	return info, nil
@@ -824,6 +972,10 @@ func getVPCStackName(name string) string {
 
 func getWorkNodeName(name string) string {
 	return name + "-eks-worker-nodes"
+}
+
+func getChangeSetName(name string) string {
+	return name + "-eks-worker-nodes-change-set"
 }
 
 func (d *Driver) createConfigMap(state state, endpoint string, capem []byte, nodeInstanceRole string) error {
@@ -1026,18 +1178,43 @@ func (d *Driver) Update(ctx context.Context, info *types.ClusterInfo, options *t
 		return nil, err
 	}
 
-	if newState.KubernetesVersion != "" &&
-		newState.KubernetesVersion != state.KubernetesVersion {
+	if newState.KubernetesVersion != "" && newState.KubernetesVersion != state.KubernetesVersion {
 		state.KubernetesVersion = newState.KubernetesVersion
-	}
 
-	if !reflect.DeepEqual(state, *oldstate) {
 		if err := d.updateClusterAndWait(ctx, state); err != nil {
 			logrus.Errorf("error updating cluster: %v", err)
 			return info, err
 		}
 	}
 
+	// TODO support changing other properties?
+	// TODO different getStateFromOptions validation for update vs. create?
+	if newState.InstanceCount != 0 {
+		state.InstanceCount = newState.InstanceCount
+	}
+	if newState.MinimumASGSize != 0 {
+		state.MinimumASGSize = newState.MinimumASGSize
+	}
+	if newState.MaximumASGSize != 0 {
+		state.MaximumASGSize = newState.MaximumASGSize
+	}
+	if len(newState.IngressRules) > 0 {
+		state.IngressRules = newState.IngressRules
+	}
+	if len(newState.EgressRules) > 0 {
+		state.EgressRules = newState.EgressRules
+	}
+	if len(newState.Tags) > 0 {
+		state.Tags = newState.Tags
+	}
+
+	if !reflect.DeepEqual(state, *oldstate) {
+		_, err = d.changeWorkers(ctx, info, state)
+		if err != nil {
+			logrus.Infof("cluster not changed: %v", err)
+			return nil, err
+		}
+	}
 	logrus.Infof("Update complete")
 	return info, storeState(info, state)
 }
