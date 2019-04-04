@@ -262,10 +262,25 @@ func deleteConfigByName(config *KubeConfig, name string) {
 }
 
 func (c CLIPersistStore) GetKubeConfig(name string) (string, error) {
+	status, err := c.GetStatus(name)
+	if err != nil {
+		return "", err
+	}
+
+	if status == cluster.Error {
+		logrus.Errorf("Cluster %s previously failed to create", name)
+		return "", fmt.Errorf("Cluster %s previously failed to create", name)
+	}
+
+	if status == cluster.PreCreating || status == cluster.Creating {
+		logrus.Errorf("Cluster %s has not been created.", name)
+		return "", fmt.Errorf("cluster %s has not been created", name)
+	}
+
 	fileDir, err := getClusterPath(name)
 	kubeConfigPath := utils.KubeConfigFilePath(fileDir)
 	if _, err := os.Stat(kubeConfigPath); os.IsNotExist(err) {
-		return "", fmt.Errorf("%s not found", name)
+		return "", fmt.Errorf("Could not get kubeconfig cluster %s", name)
 	}
 	data, err := getRawKubeConfig(kubeConfigPath)
 	if err != nil {
