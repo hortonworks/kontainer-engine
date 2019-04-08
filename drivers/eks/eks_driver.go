@@ -885,7 +885,7 @@ func getWorkerParameters(state state) (string, []*cloudformation.Parameter, erro
 			int(*state.NodeVolumeSize)))},
 		{ParameterKey: aws.String("NodeInstanceType"), ParameterValue: aws.String(state.InstanceType)},
 		{ParameterKey: aws.String("NodeImageId"), ParameterValue: aws.String(state.AMI)},
-		{ParameterKey: aws.String("KeyName"), ParameterValue: aws.String(getEC2KeyPairName(state.DisplayName))}, // TODO let the user specify this
+		{ParameterKey: aws.String("KeyName"), ParameterValue: aws.String(state.KeyPairName)}, 
 		{ParameterKey: aws.String("VpcId"), ParameterValue: aws.String(state.VirtualNetwork)},
 		{ParameterKey: aws.String("Subnets"),
 			ParameterValue: aws.String(strings.Join(state.Subnets, ","))},
