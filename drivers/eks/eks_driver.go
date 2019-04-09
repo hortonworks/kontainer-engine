@@ -39,6 +39,7 @@ import (
 
 const (
 	amiNamePrefix = "amazon-eks-node-"
+	batchSize = 5 // maximum threads could be launched for creation multiple instance
 )
 
 var amiForRegionAndVersion = map[string]map[string]string{
@@ -81,7 +82,7 @@ type Driver struct {
 	Handlers request.Handlers
 }
 
-type state struct {
+type State struct {
 	ClusterName  string
 	DisplayName  string
 	ClientID     string
@@ -90,15 +91,8 @@ type state struct {
 
 	KubernetesVersion string
 
-	InstanceCount int64
-	MinimumASGSize int64
-	MaximumASGSize int64
-	NodeVolumeSize *int64
-
 	UserData string
-
-	InstanceType string
-	Region       string
+	Region   string
 
 	VirtualNetwork              string
 	Subnets                     []string
@@ -108,20 +102,33 @@ type state struct {
 	AssociateWorkerNodePublicIP *bool
 
 	IngressRules []string
-	EgressRules []string
+	EgressRules  []string
 
 	Tags map[string]string
 
 	KeyPairName string
 
 	ClusterInfo types.ClusterInfo
+
+	InstanceGroups InstanceGroups
+}
+type InstanceGroups []InstanceGroup
+
+type InstanceGroup struct {
+	InstanceGroupName string
+	InstanceType      string
+	InstanceCount     int64
+	MinimumASGSize    int64
+	MaximumASGSize    int64
+	NodeVolumeSize    *int64
+	Labels            map[string]string
 }
 
 type securityGroupRule struct {
 	protocol string
 	fromPort uint16
-	toPort uint16
-	cidrIP string
+	toPort   uint16
+	cidrIP   string
 }
 
 func NewDriver() types.Driver {
@@ -303,8 +310,8 @@ func (d *Driver) GetDriverUpdateOptions(ctx context.Context) (*types.DriverFlags
 	return &driverFlag, nil
 }
 
-func getStateFromOptions(driverOptions *types.DriverOptions) (state, error) {
-	state := state{}
+func getStateFromOptions(driverOptions *types.DriverOptions) (State, error) {
+	state := State{}
 	state.ClusterName = options.GetValueFromDriverOptions(driverOptions, types.StringType, "name").(string)
 	state.DisplayName = options.GetValueFromDriverOptions(driverOptions, types.StringType, "display-name", "displayName").(string)
 	state.ClientID = options.GetValueFromDriverOptions(driverOptions, types.StringType, "client-id", "accessKey").(string)
@@ -313,11 +320,6 @@ func getStateFromOptions(driverOptions *types.DriverOptions) (state, error) {
 	state.KubernetesVersion = options.GetValueFromDriverOptions(driverOptions, types.StringType, "kubernetes-version", "kubernetesVersion").(string)
 
 	state.Region = options.GetValueFromDriverOptions(driverOptions, types.StringType, "region").(string)
-	state.InstanceType = options.GetValueFromDriverOptions(driverOptions, types.StringType, "instance-type", "instanceType").(string)
-	state.InstanceCount = options.GetValueFromDriverOptions(driverOptions, types.IntType, "instance-count", "instanceCount").(int64)
-	state.MinimumASGSize = options.GetValueFromDriverOptions(driverOptions, types.IntType, "minimum-nodes", "minimumNodes").(int64)
-	state.MaximumASGSize = options.GetValueFromDriverOptions(driverOptions, types.IntType, "maximum-nodes", "maximumNodes").(int64)
-	state.NodeVolumeSize, _ = options.GetValueFromDriverOptions(driverOptions, types.IntPointerType, "node-volume-size", "nodeVolumeSize").(*int64)
 	state.VirtualNetwork = options.GetValueFromDriverOptions(driverOptions, types.StringType, "virtual-network", "virtualNetwork").(string)
 	state.Subnets = options.GetValueFromDriverOptions(driverOptions, types.StringSliceType, "subnets").(*types.StringSlice).Value
 	state.ServiceRole = options.GetValueFromDriverOptions(driverOptions, types.StringType, "service-role", "serviceRole").(string)
@@ -332,8 +334,8 @@ func getStateFromOptions(driverOptions *types.DriverOptions) (state, error) {
 	state.EgressRules = options.GetValueFromDriverOptions(driverOptions, types.StringSliceType, "egress-rules").(*types.StringSlice).Value
 
 	state.Tags = make(map[string]string)
-	tagValues := options.GetValueFromDriverOptions(driverOptions, types.StringSliceType, "tags").(*types.StringSlice)
-	for _, part := range tagValues.Value {
+	tagValues := options.GetValueFromDriverOptions(driverOptions, types.StringSliceType, "tags").(*types.StringSlice).Value
+	for _, part := range tagValues {
 		kv := strings.Split(part, "=")
 		if len(kv) == 2 {
 			state.Tags[kv[0]] = kv[1]
@@ -342,7 +344,36 @@ func getStateFromOptions(driverOptions *types.DriverOptions) (state, error) {
 
 	state.KeyPairName = options.GetValueFromDriverOptions(driverOptions, types.StringType, "key-pair-name", "keyPairName").(string)
 
-	return state, state.validate()
+	InstanceGroupName := options.GetValueFromDriverOptions(driverOptions, types.StringSliceType, "instance-group-name", "instanceGroupName").(*types.StringSlice).Value
+	InstanceType := options.GetValueFromDriverOptions(driverOptions, types.StringSliceType, "instance-type", "instanceType").(*types.StringSlice).Value
+	InstanceCount := options.GetValueFromDriverOptions(driverOptions, types.StringSliceType, "instance-count", "instanceCount").(*types.StringSlice).Value
+	MinimumASGSize := options.GetValueFromDriverOptions(driverOptions, types.StringSliceType, "minimum-nodes", "minimumNodes").(*types.StringSlice).Value
+	MaximumASGSize := options.GetValueFromDriverOptions(driverOptions, types.StringSliceType, "maximum-nodes", "maximumNodes").(*types.StringSlice).Value
+	NodeVolumeSize := options.GetValueFromDriverOptions(driverOptions, types.StringSliceType, "node-volume-size", "nodeVolumeSize").(*types.StringSlice).Value
+
+	fmt.Printf("Inside EKS : InstanceGroupName: %s\n", InstanceGroupName)
+	fmt.Printf("Inside EKS : InstanceType: %s\n", InstanceType)
+	fmt.Printf("Inside EKS : InstanceCount: %s\n", InstanceCount)
+	fmt.Printf("Inside EKS : MinimumASGSize: %s\n", MinimumASGSize)
+	fmt.Printf("Inside EKS : MaximumASGSize: %s\n", MaximumASGSize)
+	fmt.Printf("Inside EKS : NodeVolumeSize: %s\n", NodeVolumeSize)
+
+	// Assuming number of groups equals to number of group name provided.
+	var instanceGroups = make(InstanceGroups, len(InstanceGroupName))
+	for i, v := range InstanceGroupName {
+		var instanceGroup InstanceGroup
+		instanceGroup.InstanceGroupName = v
+		instanceGroup.InstanceType = InstanceType[i]
+		instanceGroup.InstanceCount, _ = strconv.ParseInt(InstanceCount[i], 10, 64)
+		instanceGroup.MinimumASGSize, _ = strconv.ParseInt(MinimumASGSize[i], 10, 64)
+		instanceGroup.MaximumASGSize, _ = strconv.ParseInt(MaximumASGSize[i], 10, 64)
+		volumeSize, _ := strconv.ParseInt(NodeVolumeSize[i], 10, 64)
+		instanceGroup.NodeVolumeSize = &volumeSize
+		instanceGroups[i] = instanceGroup
+	}
+	state.InstanceGroups = instanceGroups
+
+	return state, state.Validate()
 }
 
 func convertSecurityGroupRules(ruleStrings []string) ([]securityGroupRule, error) {
@@ -384,7 +415,7 @@ func convertSecurityGroupRules(ruleStrings []string) ([]securityGroupRule, error
 	return rules, nil
 }
 
-func (state *state) validate() error {
+func (state *State) Validate() error {
 	if state.DisplayName == "" {
 		return fmt.Errorf("display name is required")
 	}
@@ -412,28 +443,30 @@ func (state *state) validate() error {
 		}
 	}
 
-	if state.MinimumASGSize < 1 {
-		return fmt.Errorf("minimum nodes must be greater than 0")
-	}
+	for _, instanceGroup := range state.InstanceGroups {
+		if instanceGroup.MinimumASGSize < 1 {
+			return fmt.Errorf("minimum nodes must be greater than 0. InstanceGroupName: %s", instanceGroup.InstanceGroupName)
+		}
 
-	if state.MaximumASGSize < 1 {
-		return fmt.Errorf("maximum nodes must be greater than 0")
-	}
+		if instanceGroup.MaximumASGSize < 1 {
+			return fmt.Errorf("maximum nodes must be greater than 0. InstanceGroupName: %s", instanceGroup.InstanceGroupName)
+		}
 
-	if state.MaximumASGSize < state.MinimumASGSize {
-		return fmt.Errorf("maximum nodes cannot be less than minimum nodes")
-	}
+		if instanceGroup.MaximumASGSize < instanceGroup.MinimumASGSize {
+			return fmt.Errorf("maximum nodes cannot be less than minimum nodes. InstanceGroupName: %s", instanceGroup.InstanceGroupName)
+		}
 
-	if state.InstanceCount < state.MinimumASGSize {
-		return fmt.Errorf("instance count cannot be less than minimum nodes")
-	}
+		if instanceGroup.InstanceCount < instanceGroup.MinimumASGSize {
+			return fmt.Errorf("instance count cannot be less than minimum nodes. InstanceGroupName: %s", instanceGroup.InstanceGroupName)
+		}
 
-	if state.InstanceCount > state.MaximumASGSize {
-		return fmt.Errorf("instance count cannot be greater than maximum nodes")
-	}
+		if instanceGroup.InstanceCount > instanceGroup.MaximumASGSize {
+			return fmt.Errorf("instance count cannot be greater than maximum nodes. InstanceGroupName: %s", instanceGroup.InstanceGroupName)
+		}
 
-	if state.NodeVolumeSize != nil && *state.NodeVolumeSize < 1 {
-		return fmt.Errorf("node volume size must be greater than 0")
+		if instanceGroup.NodeVolumeSize != nil && *instanceGroup.NodeVolumeSize < 1 {
+			return fmt.Errorf("node volume size must be greater than 0. InstanceGroupName: %s", instanceGroup.InstanceGroupName)
+		}
 	}
 
 	networkEmpty := state.VirtualNetwork == ""
@@ -471,7 +504,7 @@ func (d *Driver) createStack(svc *cloudformation.CloudFormation, name string, ta
 		TemplateBody: aws.String(templateBody),
 		Capabilities: aws.StringSlice(capabilities),
 		Parameters:   parameters,
-		Tags: tags,
+		Tags:         tags,
 	})
 	if err != nil && !alreadyExistsInCloudFormationError(err) {
 		return nil, fmt.Errorf("error creating master: %v", err)
@@ -530,11 +563,11 @@ func (d *Driver) changeStack(svc *cloudformation.CloudFormation, changeSetName s
 
 	_, err := svc.CreateChangeSet(&cloudformation.CreateChangeSetInput{
 		ChangeSetName: aws.String(changeSetName),
-		StackName:    aws.String(name),
-		TemplateBody: aws.String(templateBody),
-		Capabilities: aws.StringSlice(capabilities),
-		Parameters:   parameters,
-		Tags: tags,
+		StackName:     aws.String(name),
+		TemplateBody:  aws.String(templateBody),
+		Capabilities:  aws.StringSlice(capabilities),
+		Parameters:    parameters,
+		Tags:          tags,
 	})
 	if err != nil {
 		return fmt.Errorf("error creating change set: %v", err)
@@ -546,7 +579,7 @@ func (d *Driver) changeStack(svc *cloudformation.CloudFormation, changeSetName s
 		time.Sleep(time.Second * 10)
 		desc, err = svc.DescribeChangeSet(&cloudformation.DescribeChangeSetInput{
 			ChangeSetName: aws.String(changeSetName),
-			StackName:    aws.String(name),
+			StackName:     aws.String(name),
 		})
 		if err != nil {
 			return d.cleanupChangeSet(svc, changeSetName, name, fmt.Errorf("error polling change set status: %v", err))
@@ -562,7 +595,7 @@ func (d *Driver) changeStack(svc *cloudformation.CloudFormation, changeSetName s
 
 	_, err = svc.ExecuteChangeSet(&cloudformation.ExecuteChangeSetInput{
 		ChangeSetName: aws.String(changeSetName),
-		StackName:    aws.String(name),
+		StackName:     aws.String(name),
 	})
 	if err != nil {
 		return d.cleanupChangeSet(svc, changeSetName, name, fmt.Errorf("error executing change set: %v", err))
@@ -592,7 +625,7 @@ func (d *Driver) changeStack(svc *cloudformation.CloudFormation, changeSetName s
 func (d *Driver) cleanupChangeSet(svc *cloudformation.CloudFormation, changeSetName string, name string, err error) error {
 	_, err2 := svc.DeleteChangeSet(&cloudformation.DeleteChangeSetInput{
 		ChangeSetName: aws.String(changeSetName),
-		StackName:    aws.String(name),
+		StackName:     aws.String(name),
 	})
 	if err2 == nil {
 		return fmt.Errorf("%v", err)
@@ -688,32 +721,33 @@ func (d *Driver) Create(ctx context.Context, options *types.DriverOptions, _ *ty
 		state.AssociateWorkerNodePublicIP = &b
 	}
 
-	if state.NodeVolumeSize == nil {
-		var volumeSize int64 = 20
-		state.NodeVolumeSize = &volumeSize
-	}
-
 	storeState(info, state) // store state again now that initialization is complete
+	var nodeInstanceRoles []string;
+	for _, instanceGroup := range state.InstanceGroups {
 
-	workerNodesFinalTemplate, workerParameters, err := getWorkerParameters(state)
-	if err != nil {
-		return info, err
+		workerNodesFinalTemplate, workerParameters, err := getWorkerParameters(state, instanceGroup)
+		if err != nil {
+			return info, err
+		}
+
+		logrus.Infof("Creating worker nodes! Stack-name: %s", getWorkNodeName(instanceGroup.InstanceGroupName))
+		stack, err := d.createStack(svc, getWorkNodeName(instanceGroup.InstanceGroupName), tags, workerNodesFinalTemplate,
+			[]string{cloudformation.CapabilityCapabilityIam},
+			workerParameters)
+		if err != nil {
+			return info, fmt.Errorf("error creating stack: %v", err)
+		}
+
+		nodeInstanceRole := getParameterValueFromOutput("NodeInstanceRole", stack.Stacks[0].Outputs)
+		if nodeInstanceRole == "" {
+			return info, fmt.Errorf("no node instance role returned in output: %v", err)
+		}
+		nodeInstanceRoles = append(nodeInstanceRoles, nodeInstanceRole)
 	}
 
-	logrus.Infof("Creating worker nodes! Stack-name: %s", getWorkNodeName(state.DisplayName))
-	stack, err := d.createStack(svc, getWorkNodeName(state.DisplayName), tags, workerNodesFinalTemplate,
-		[]string{cloudformation.CapabilityCapabilityIam},
-		workerParameters)
-	if err != nil {
-		return info, fmt.Errorf("error creating stack: %v", err)
-	}
 
-	nodeInstanceRole := getParameterValueFromOutput("NodeInstanceRole", stack.Stacks[0].Outputs)
-	if nodeInstanceRole == "" {
-		return info, fmt.Errorf("no node instance role returned in output: %v", err)
-	}
 
-	err = d.createConfigMap(state, *cluster.Cluster.Endpoint, capem, nodeInstanceRole)
+	err = d.createConfigMap(state, *cluster.Cluster.Endpoint, capem, nodeInstanceRoles)
 	if err != nil {
 		return info, err
 	}
@@ -721,10 +755,16 @@ func (d *Driver) Create(ctx context.Context, options *types.DriverOptions, _ *ty
 	return info, nil
 }
 
-func getTags(state state) []*cloudformation.Tag {
+// Helper struct used inside go func
+type NodeInstanceRoleChan struct {
+	Arn string
+	Err error
+}
+
+func getTags(state State) []*cloudformation.Tag {
 	tags := []*cloudformation.Tag{}
 	tag := &cloudformation.Tag{Key: aws.String("displayName"), Value: aws.String(state.DisplayName)}
-	tags = append(tags,tag)
+	tags = append(tags, tag)
 	for key, val := range state.Tags {
 		if val != "" {
 			tag := &cloudformation.Tag{Key: aws.String(key), Value: aws.String(val)}
@@ -734,7 +774,7 @@ func getTags(state state) []*cloudformation.Tag {
 	return tags
 }
 
-func (d *Driver) initVpc(svc *cloudformation.CloudFormation, state *state, tags []*cloudformation.Tag) error {
+func (d *Driver) initVpc(svc *cloudformation.CloudFormation, state *State, tags []*cloudformation.Tag) error {
 	if state.VirtualNetwork != "" {
 		logrus.Infof("VPC info provided, skipping create")
 		return nil
@@ -766,7 +806,7 @@ func (d *Driver) initVpc(svc *cloudformation.CloudFormation, state *state, tags 
 	}
 
 	for _, resource := range resources.StackResources {
-		logrus.Infof("LogicalResourceId: %s PhysicalResourceId: %s",*resource.LogicalResourceId, *resource.PhysicalResourceId)
+		logrus.Infof("LogicalResourceId: %s PhysicalResourceId: %s", *resource.LogicalResourceId, *resource.PhysicalResourceId)
 		if *resource.LogicalResourceId == "VPC" {
 			state.VirtualNetwork = *resource.PhysicalResourceId
 		}
@@ -774,7 +814,7 @@ func (d *Driver) initVpc(svc *cloudformation.CloudFormation, state *state, tags 
 	return nil
 }
 
-func (d *Driver) initRoleARN(svc *cloudformation.CloudFormation, sess *session.Session, state *state, tags []*cloudformation.Tag) (string, error) {
+func (d *Driver) initRoleARN(svc *cloudformation.CloudFormation, sess *session.Session, state *State, tags []*cloudformation.Tag) (string, error) {
 	var roleARN string
 	if state.ServiceRole == "" {
 		logrus.Infof("Creating service role:%s", getServiceRoleName(state.DisplayName))
@@ -805,7 +845,7 @@ func (d *Driver) initRoleARN(svc *cloudformation.CloudFormation, sess *session.S
 	return roleARN, nil
 }
 
-func (d *Driver) initCluster(svc *cloudformation.CloudFormation, sess *session.Session, state *state, tags []*cloudformation.Tag) (*eks.DescribeClusterOutput, error) {
+func (d *Driver) initCluster(svc *cloudformation.CloudFormation, sess *session.Session, state *State, tags []*cloudformation.Tag) (*eks.DescribeClusterOutput, error) {
 	roleARN, err := d.initRoleARN(svc, sess, state, tags)
 	if err != nil {
 		return nil, err
@@ -837,7 +877,7 @@ func (d *Driver) initCluster(svc *cloudformation.CloudFormation, sess *session.S
 	return cluster, nil
 }
 
-func getWorkerParameters(state state) (string, []*cloudformation.Parameter, error) {
+func getWorkerParameters(state State, instanceGroup InstanceGroup) (string, []*cloudformation.Parameter, error) {
 	ingressRules, err := convertSecurityGroupRules(state.IngressRules)
 	if err != nil {
 		return "", nil, err
@@ -874,18 +914,18 @@ func getWorkerParameters(state state) (string, []*cloudformation.Parameter, erro
 		{ParameterKey: aws.String("ClusterControlPlaneSecurityGroup"),
 			ParameterValue: aws.String(strings.Join(state.SecurityGroups, ","))},
 		{ParameterKey: aws.String("NodeGroupName"),
-			ParameterValue: aws.String(state.DisplayName + "-node-group")},
+			ParameterValue: aws.String(getNodeGroupName(instanceGroup.InstanceGroupName))},
 		{ParameterKey: aws.String("NodeAutoScalingGroupDesiredCapacity"), ParameterValue: aws.String(strconv.Itoa(
-			int(state.InstanceCount)))},
+			int(instanceGroup.InstanceCount)))},
 		{ParameterKey: aws.String("NodeAutoScalingGroupMinSize"), ParameterValue: aws.String(strconv.Itoa(
-			int(state.MinimumASGSize)))},
+			int(instanceGroup.MinimumASGSize)))},
 		{ParameterKey: aws.String("NodeAutoScalingGroupMaxSize"), ParameterValue: aws.String(strconv.Itoa(
-			int(state.MaximumASGSize)))},
+			int(instanceGroup.MaximumASGSize)))},
 		{ParameterKey: aws.String("NodeVolumeSize"), ParameterValue: aws.String(strconv.Itoa(
-			int(*state.NodeVolumeSize)))},
-		{ParameterKey: aws.String("NodeInstanceType"), ParameterValue: aws.String(state.InstanceType)},
+			int(*instanceGroup.NodeVolumeSize)))},
+		{ParameterKey: aws.String("NodeInstanceType"), ParameterValue: aws.String(instanceGroup.InstanceType)},
 		{ParameterKey: aws.String("NodeImageId"), ParameterValue: aws.String(state.AMI)},
-		{ParameterKey: aws.String("KeyName"), ParameterValue: aws.String(state.KeyPairName)}, 
+		{ParameterKey: aws.String("KeyName"), ParameterValue: aws.String(state.KeyPairName)},
 		{ParameterKey: aws.String("VpcId"), ParameterValue: aws.String(state.VirtualNetwork)},
 		{ParameterKey: aws.String("Subnets"),
 			ParameterValue: aws.String(strings.Join(state.Subnets, ","))},
@@ -893,7 +933,7 @@ func getWorkerParameters(state state) (string, []*cloudformation.Parameter, erro
 	}, nil
 }
 
-func (d *Driver) changeWorkers(ctx context.Context, info *types.ClusterInfo, state state) (*types.ClusterInfo, error) {
+func (d *Driver) changeWorkers(ctx context.Context, info *types.ClusterInfo, state State) (*types.ClusterInfo, error) {
 	logrus.Infof("New State Info %+v", state)
 
 	sess, err := session.NewSession(&aws.Config{
@@ -925,22 +965,20 @@ func (d *Driver) changeWorkers(ctx context.Context, info *types.ClusterInfo, sta
 		state.AssociateWorkerNodePublicIP = &b
 	}
 
-	if state.NodeVolumeSize == nil {
-		var volumeSize int64 = 20
-		state.NodeVolumeSize = &volumeSize
-	}
+	for _, instanceGroup := range state.InstanceGroups {
 
-	workerNodesFinalTemplate, workerParameters, err := getWorkerParameters(state)
-	if err != nil {
-		return info, err
-	}
+		workerNodesFinalTemplate, workerParameters, err := getWorkerParameters(state, instanceGroup)
+		if err != nil {
+			return info, err
+		}
 
-	logrus.Infof("Changing worker nodes! Stack-name: %s", getWorkNodeName(state.DisplayName))
-	err = d.changeStack(svc, getChangeSetName(state.DisplayName), getWorkNodeName(state.DisplayName), tags, workerNodesFinalTemplate,
-		[]string{cloudformation.CapabilityCapabilityIam},
-		workerParameters)
-	if err != nil {
-		return info, fmt.Errorf("error changing stack: %v", err)
+		logrus.Infof("Changing worker nodes! Stack-name: %s", getWorkNodeName(instanceGroup.InstanceGroupName))
+		err = d.changeStack(svc, getChangeSetName(state.DisplayName), getWorkNodeName(instanceGroup.InstanceGroupName), tags, workerNodesFinalTemplate,
+			[]string{cloudformation.CapabilityCapabilityIam},
+			workerParameters)
+		if err != nil {
+			return info, fmt.Errorf("error changing stack: %v", err)
+		}
 	}
 
 	return info, nil
@@ -974,26 +1012,32 @@ func getWorkNodeName(name string) string {
 	return name + "-eks-worker-nodes"
 }
 
+func getNodeGroupName(name string) string {
+	return name + "-node-group"
+}
+
 func getChangeSetName(name string) string {
 	return name + "-eks-worker-nodes-change-set"
 }
 
-func (d *Driver) createConfigMap(state state, endpoint string, capem []byte, nodeInstanceRole string) error {
+func (d *Driver) createConfigMap(state State, endpoint string, capem []byte, nodeInstanceRoles []string) error {
 	clientset, err := createClientset(state.DisplayName, state, endpoint, capem)
 	if err != nil {
 		return fmt.Errorf("error creating clientset: %v", err)
 	}
-
-	data := []map[string]interface{}{
-		{
+	data := make([]map[string]interface{}, 0)
+	for _, nodeInstanceRole := range nodeInstanceRoles {
+		arn := map[string]interface{}{
 			"rolearn":  nodeInstanceRole,
 			"username": "system:node:{{EC2PrivateDNSName}}",
 			"groups": []string{
 				"system:bootstrappers",
 				"system:nodes",
 			},
-		},
+		}
+		data = append(data, arn)
 	}
+	fmt.Printf("Data %+v\n", data)
 	mapRoles, err := yaml.Marshal(data)
 	if err != nil {
 		return fmt.Errorf("error marshalling map roles: %v", err)
@@ -1021,7 +1065,7 @@ func (d *Driver) createConfigMap(state state, endpoint string, capem []byte, nod
 	return nil
 }
 
-func createClientset(name string, state state, endpoint string, capem []byte) (*kubernetes.Clientset, error) {
+func createClientset(name string, state State, endpoint string, capem []byte) (*kubernetes.Clientset, error) {
 	token, err := getEKSToken(name, state)
 	if err != nil {
 		return nil, fmt.Errorf("error generating token: %v", err)
@@ -1049,7 +1093,7 @@ const awsSharedCredentialsFile = "AWS_SHARED_CREDENTIALS_FILE"
 
 var awsCredentialsLocker = &sync.Mutex{}
 
-func getEKSToken(name string, state state) (string, error) {
+func getEKSToken(name string, state State) (string, error) {
 	generator, err := heptio.NewGenerator()
 	if err != nil {
 		return "", fmt.Errorf("error creating generator: %v", err)
@@ -1096,7 +1140,7 @@ aws_session_token=%v`,
 	return generator.Get(name)
 }
 
-func (d *Driver) waitForClusterReady(svc *eks.EKS, state state) (*eks.DescribeClusterOutput, error) {
+func (d *Driver) waitForClusterReady(svc *eks.EKS, state State) (*eks.DescribeClusterOutput, error) {
 	var cluster *eks.DescribeClusterOutput
 	var err error
 
@@ -1127,7 +1171,7 @@ func (d *Driver) waitForClusterReady(svc *eks.EKS, state state) (*eks.DescribeCl
 	return cluster, nil
 }
 
-func storeState(info *types.ClusterInfo, state state) error {
+func storeState(info *types.ClusterInfo, state State) error {
 	data, err := json.Marshal(state)
 
 	if err != nil {
@@ -1143,8 +1187,8 @@ func storeState(info *types.ClusterInfo, state state) error {
 	return nil
 }
 
-func getState(info *types.ClusterInfo) (state, error) {
-	state := state{}
+func getState(info *types.ClusterInfo) (State, error) {
+	state := State{}
 
 	err := json.Unmarshal([]byte(info.Metadata["state"]), &state)
 	if err != nil {
@@ -1166,7 +1210,7 @@ func getParameterValueFromOutput(key string, outputs []*cloudformation.Output) s
 
 func (d *Driver) Update(ctx context.Context, info *types.ClusterInfo, options *types.DriverOptions) (*types.ClusterInfo, error) {
 	logrus.Infof("Starting update")
-	oldstate := &state{}
+	oldstate := &State{}
 	state, err := getState(info)
 	if err != nil {
 		return nil, err
@@ -1187,17 +1231,20 @@ func (d *Driver) Update(ctx context.Context, info *types.ClusterInfo, options *t
 		}
 	}
 
-	// TODO support changing other properties?
-	// TODO different getStateFromOptions validation for update vs. create?
-	if newState.InstanceCount != 0 {
-		state.InstanceCount = newState.InstanceCount
+	for i, instanceGroup := range newState.InstanceGroups {
+		// TODO support changing other properties?
+		// TODO different getStateFromOptions validation for update vs. create?
+		if instanceGroup.InstanceCount != 0 {
+			state.InstanceGroups[i].InstanceCount = instanceGroup.InstanceCount
+		}
+		if instanceGroup.MinimumASGSize != 0 {
+			state.InstanceGroups[i].MinimumASGSize = instanceGroup.MinimumASGSize
+		}
+		if instanceGroup.MaximumASGSize != 0 {
+			state.InstanceGroups[i].MaximumASGSize = instanceGroup.MaximumASGSize
+		}
 	}
-	if newState.MinimumASGSize != 0 {
-		state.MinimumASGSize = newState.MinimumASGSize
-	}
-	if newState.MaximumASGSize != 0 {
-		state.MaximumASGSize = newState.MaximumASGSize
-	}
+
 	if len(newState.IngressRules) > 0 {
 		state.IngressRules = newState.IngressRules
 	}
@@ -1342,19 +1389,21 @@ func (d *Driver) Remove(ctx context.Context, info *types.ClusterInfo) error {
 
 	svc := cloudformation.New(sess)
 
-	err = deleteStack(svc, getServiceRoleName(state.DisplayName), getServiceRoleName(state.ClusterName))
+	err = deleteStack(svc, getServiceRoleName(state.DisplayName))
 	if err != nil {
 		return fmt.Errorf("error deleting service role stack: %v", err)
 	}
 
-	err = deleteStack(svc, getVPCStackName(state.DisplayName), getVPCStackName(state.ClusterName))
+	err = deleteStack(svc, getVPCStackName(state.DisplayName))
 	if err != nil {
 		return fmt.Errorf("error deleting vpc stack: %v", err)
 	}
 
-	err = deleteStack(svc, getWorkNodeName(state.DisplayName), getWorkNodeName(state.ClusterName))
-	if err != nil {
-		return fmt.Errorf("error deleting worker node stack: %v", err)
+	for _, instanceGroup := range state.InstanceGroups {
+		err = deleteStack(svc, getWorkNodeName(instanceGroup.InstanceGroupName))
+		if err != nil {
+			return fmt.Errorf("error deleting worker node stack: %v", err)
+		}
 	}
 
 	ec2svc := ec2.New(sess)
@@ -1377,16 +1426,9 @@ func (d *Driver) Remove(ctx context.Context, info *types.ClusterInfo) error {
 	return err
 }
 
-func deleteStack(svc *cloudformation.CloudFormation, newStyleName, oldStyleName string) error {
-	name := newStyleName
-	_, err := svc.DescribeStacks(&cloudformation.DescribeStacksInput{
-		StackName: aws.String(name),
-	})
-	if doesNotExist(err) {
-		name = oldStyleName
-	}
+func deleteStack(svc *cloudformation.CloudFormation, name string) error {
 
-	_, err = svc.DeleteStack(&cloudformation.DeleteStackInput{
+	_, err := svc.DeleteStack(&cloudformation.DeleteStackInput{
 		StackName: aws.String(name),
 	})
 	if err != nil {
@@ -1493,7 +1535,7 @@ func (d *Driver) SetVersion(ctx context.Context, info *types.ClusterInfo, versio
 	return nil
 }
 
-func (d *Driver) updateClusterAndWait(ctx context.Context, state state) error {
+func (d *Driver) updateClusterAndWait(ctx context.Context, state State) error {
 	sess, err := session.NewSession(&aws.Config{
 		Region: aws.String(state.Region),
 		Credentials: credentials.NewStaticCredentials(
@@ -1529,7 +1571,7 @@ func (d *Driver) updateClusterAndWait(ctx context.Context, state state) error {
 	return d.waitForClusterUpdateReady(ctx, svc, state, *output.Update.Id)
 }
 
-func (d *Driver) waitForClusterUpdateReady(ctx context.Context, svc *eks.EKS, state state, updateID string) error {
+func (d *Driver) waitForClusterUpdateReady(ctx context.Context, svc *eks.EKS, state State, updateID string) error {
 	logrus.Infof("waiting for update id[%s] state", updateID)
 	var update *eks.DescribeUpdateOutput
 	var err error
@@ -1571,7 +1613,7 @@ func (d *Driver) waitForClusterUpdateReady(ctx context.Context, svc *eks.EKS, st
 	return nil
 }
 
-func getAMIs(ctx context.Context, ec2svc *ec2.EC2, state state) string {
+func getAMIs(ctx context.Context, ec2svc *ec2.EC2, state State) string {
 	if rtn := getLocalAMI(state); rtn != "" {
 		return rtn
 	}
@@ -1621,7 +1663,7 @@ func getAMIs(ctx context.Context, ec2svc *ec2.EC2, state state) string {
 	return rtnImage
 }
 
-func getLocalAMI(state state) string {
+func getLocalAMI(state State) string {
 	amiForRegion, ok := amiForRegionAndVersion[state.KubernetesVersion]
 	if !ok {
 		return ""
